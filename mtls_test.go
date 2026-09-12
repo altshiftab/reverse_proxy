@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	altshiftMux "github.com/altshiftab/utils_go/pkg/http/mux"
 )
 
 // authority is a certificate authority the tests issue from.
@@ -60,7 +63,7 @@ func newAuthority(t *testing.T, name string) *authority {
 }
 
 // issue returns a leaf certificate signed by the authority.
-func (ca *authority) issue(t *testing.T, commonName string, serverName string) tls.Certificate {
+func (ca *authority) issue(t *testing.T, commonName string, serverNames ...string) tls.Certificate {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -76,8 +79,10 @@ func (ca *authority) issue(t *testing.T, commonName string, serverName string) t
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 	}
-	if serverName != "" {
-		template.DNSNames = []string{serverName}
+	for _, serverName := range serverNames {
+		if serverName != "" {
+			template.DNSNames = append(template.DNSNames, serverName)
+		}
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, ca.certificate, &key.PublicKey, ca.key)
@@ -235,14 +240,14 @@ func TestClientAuthenticationAcceptsOnlyThePinnedAuthority(t *testing.T) {
 	}{
 		{
 			name:              "a certificate from the pinned authority is accepted",
-			clientCertificate: certificatePointer(pinned.issue(t, "client", "")),
+			clientCertificate: certificatePointer(pinned.issue(t, "client")),
 			expectAccepted:    true,
 		},
 		{
 			// This is the case the old configuration would have let through, since
 			// verification fell back to the system roots.
 			name:              "a certificate from another authority is rejected",
-			clientCertificate: certificatePointer(other.issue(t, "client", "")),
+			clientCertificate: certificatePointer(other.issue(t, "client")),
 			expectAccepted:    false,
 		},
 		{
@@ -285,4 +290,161 @@ func TestClientAuthenticationAcceptsOnlyThePinnedAuthority(t *testing.T) {
 
 func certificatePointer(certificate tls.Certificate) *tls.Certificate {
 	return &certificate
+}
+
+// TestServerNameCannotDisagreeWithHost proves that a connection cannot
+// handshake as one vhost and then address another.
+//
+// The listener picks a TLS configuration by the server name in the handshake
+// while the mux routes by the host on the request, and nothing in HTTP makes
+// the two agree. Before the mux compared them, connecting to a vhost that
+// required no client certificate and sending the host of one that did reached
+// the second vhost's upstream unauthenticated -- which on the deployment was
+// the journal sink and the container registry.
+func TestServerNameCannotDisagreeWithHost(t *testing.T) {
+	t.Parallel()
+
+	const openHost = "restic.home.arpa"
+	const protectedHost = "upload-logs.home.arpa"
+
+	ca := newAuthority(t, "test ca")
+	serverCertificate := ca.issue(t, "server", openHost, protectedHost)
+	caPath := writeCaFile(t, ca)
+
+	hostToConfiguration := map[string]*UpstreamConfiguration{
+		openHost:      {Url: "http://upstream"},
+		protectedHost: {Url: "http://upstream", UseClientAuthentication: true, ClientCaFilePath: caPath},
+	}
+
+	hostToTlsConfig := make(map[string]*tls.Config, len(hostToConfiguration))
+	hostToSpecification := make(map[string]*altshiftMux.VhostMuxSpecification, len(hostToConfiguration))
+
+	for host, upstreamConfiguration := range hostToConfiguration {
+		hostTlsConfig, err := newHostTlsConfig(serverCertificate, upstreamConfiguration)
+		if err != nil {
+			t.Fatalf("new host tls config (%s): %v", host, err)
+		}
+		hostToTlsConfig[host] = hostTlsConfig
+
+		hostToSpecification[host] = &altshiftMux.VhostMuxSpecification{
+			Mux: http.HandlerFunc(func(responseWriter http.ResponseWriter, _ *http.Request) {
+				_, _ = responseWriter.Write([]byte(host))
+			}),
+		}
+	}
+
+	server := httptest.NewUnstartedServer(&altshiftMux.VhostMux{HostToSpecification: hostToSpecification})
+	server.TLS = newServerTlsConfig(hostToTlsConfig)
+	server.StartTLS()
+	// Not defer: the subtests below are parallel, so they run after this
+	// function returns. A cleanup runs after they finish, a defer before.
+	t.Cleanup(server.Close)
+
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.certificate)
+
+	testCases := []struct {
+		name                  string
+		serverName            string
+		host                  string
+		withClientCertificate bool
+		expectStatus          int
+		expectBody            string
+		expectDialFailure     bool
+	}{
+		{
+			name:         "the open vhost serves its own host",
+			serverName:   openHost,
+			host:         openHost,
+			expectStatus: http.StatusOK,
+			expectBody:   openHost,
+		},
+		{
+			// The bypass: no client certificate anywhere in this request.
+			name:         "the open vhost cannot address the protected one",
+			serverName:   openHost,
+			host:         protectedHost,
+			expectStatus: http.StatusMisdirectedRequest,
+		},
+		{
+			name:                  "the protected vhost serves a client it authenticated",
+			serverName:            protectedHost,
+			host:                  protectedHost,
+			withClientCertificate: true,
+			expectStatus:          http.StatusOK,
+			expectBody:            protectedHost,
+		},
+		{
+			name:              "the protected vhost still demands a certificate",
+			serverName:        protectedHost,
+			host:              protectedHost,
+			expectDialFailure: true,
+		},
+		{
+			name:                  "an authenticated client cannot address another vhost either",
+			serverName:            protectedHost,
+			host:                  openHost,
+			withClientCertificate: true,
+			expectStatus:          http.StatusMisdirectedRequest,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientTlsConfig := &tls.Config{RootCAs: roots, ServerName: testCase.serverName}
+			if testCase.withClientCertificate {
+				clientTlsConfig.Certificates = []tls.Certificate{ca.issue(t, "client")}
+			}
+
+			client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTlsConfig}}
+
+			// The URL addresses the listener, so the server name and the host
+			// are set independently of it and of each other -- which is the
+			// disagreement being tested.
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			request.Host = testCase.host
+
+			response, err := client.Do(request)
+			if testCase.expectDialFailure {
+				if err == nil {
+					_ = response.Body.Close()
+					t.Fatal("expected the request to fail")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("do request: %v", err)
+			}
+			defer func() {
+				_ = response.Body.Close()
+			}()
+
+			if response.StatusCode != testCase.expectStatus {
+				t.Errorf("status = %d, want %d", response.StatusCode, testCase.expectStatus)
+			}
+
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+
+			if testCase.expectBody != "" {
+				if string(body) != testCase.expectBody {
+					t.Errorf("body = %q, want %q", body, testCase.expectBody)
+				}
+				return
+			}
+
+			// Each vhost answers with its own name, so a refusal is only a
+			// refusal if neither of them wrote the body.
+			if string(body) == openHost || string(body) == protectedHost {
+				t.Errorf("a vhost served the request: %q", body)
+			}
+		})
+	}
 }

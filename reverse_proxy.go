@@ -333,6 +333,38 @@ func newHostTlsConfig(
 	return tlsConfig, nil
 }
 
+// newServerTlsConfig returns the configuration the listener hands out, which
+// selects a host's own configuration by the server name in the handshake. A
+// server name nothing is configured for fails the handshake rather than being
+// served another host's certificate.
+//
+// What a connection is allowed to ask for is settled here and nowhere else, so
+// the mux refuses a request whose host is not the server name this matched on;
+// without that, handshaking as a host that requires no client certificate and
+// then addressing one that does would bypass its client authentication.
+func newServerTlsConfig(hostToTlsConfig map[string]*tls.Config) *tls.Config {
+	return &tls.Config{
+		GetConfigForClient: func(clientHelloInfo *tls.ClientHelloInfo) (*tls.Config, error) {
+			if clientHelloInfo == nil {
+				return nil, altshiftErrors.NewWithTrace(nil_error.New("client hello info"))
+			}
+
+			serverName := clientHelloInfo.ServerName
+
+			hostTlsConfig, ok := hostToTlsConfig[serverName]
+			if !ok {
+				// Fail the TLS handshake when there is no matching configuration for the server name.
+				return nil, altshiftErrors.NewWithTrace(
+					fmt.Errorf("%w: %q", errNoUpstreamConfiguration, serverName),
+					serverName,
+				)
+			}
+
+			return hostTlsConfig, nil
+		},
+	}
+}
+
 func main() {
 	config, err := parseArguments()
 	if err != nil {
@@ -674,26 +706,7 @@ func main() {
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		IdleTimeout:       idleTimeout,
-		TLSConfig: &tls.Config{
-			GetConfigForClient: func(clientHelloInfo *tls.ClientHelloInfo) (*tls.Config, error) {
-				if clientHelloInfo == nil {
-					return nil, altshiftErrors.NewWithTrace(nil_error.New("client hello info"))
-				}
-
-				serverName := clientHelloInfo.ServerName
-
-				hostTlsConfig, ok := hostToTlsConfig[serverName]
-				if !ok {
-					// Fail the TLS handshake when there is no matching configuration for the server name.
-					return nil, altshiftErrors.NewWithTrace(
-						fmt.Errorf("%w: %q", errNoUpstreamConfiguration, serverName),
-						serverName,
-					)
-				}
-
-				return hostTlsConfig, nil
-			},
-		},
+		TLSConfig:         newServerTlsConfig(hostToTlsConfig),
 	}
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {
