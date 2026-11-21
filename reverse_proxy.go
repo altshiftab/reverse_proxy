@@ -253,9 +253,11 @@ type CliConfig struct {
 	KeyFilePath         string
 	ConfigFilePath      string
 	Verbose             bool
+	// KeepResponseBody is how much of each response's body is kept for its log line; zero keeps all of it.
+	KeepResponseBody int
 }
 
-func parseArguments() (*CliConfig, error) {
+func parseArguments(arguments []string) (*CliConfig, error) {
 	config := &CliConfig{
 		// The environment provides the defaults; an argument overrides one.
 		ServerAddress:       altshiftEnv.GetEnvWithDefault("SERVER_ADDRESS", ":443"),
@@ -273,6 +275,16 @@ func parseArguments() (*CliConfig, error) {
 			option.NewStringOption('k', "key", "Path to the TLS key file.", false, &config.KeyFilePath),
 			option.NewStringOption(0, "config", "Path to the configuration file.", false, &config.ConfigFilePath),
 			option.NewBoolOption('v', "verbose", "Log at debug level.", false, &config.Verbose),
+			option.WithDefault(option.WithMetavar(
+				option.NewIntOption(
+					0,
+					"keep-response-body",
+					"How much of each response's body to keep in memory for its log line, which shows at most its start. 0 keeps all of it.",
+					false,
+					&config.KeepResponseBody,
+				),
+				"BYTES",
+			), "0"),
 		},
 	}
 
@@ -280,8 +292,15 @@ func parseArguments() (*CliConfig, error) {
 		return nil, altshiftErrors.New(fmt.Errorf("parser validate: %w", err))
 	}
 
-	if err := parser.Parse(); err != nil {
-		return nil, altshiftErrors.New(fmt.Errorf("parse: %w", err))
+	if err := parser.ParseArgs(arguments); err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("parse args: %w", err))
+	}
+
+	if config.KeepResponseBody < 0 {
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: --keep-response-body is negative", altshiftErrors.ErrValidationError),
+			config.KeepResponseBody,
+		)
 	}
 
 	return config, nil
@@ -366,7 +385,7 @@ func newServerTlsConfig(hostToTlsConfig map[string]*tls.Config) *tls.Config {
 }
 
 func main() {
-	config, err := parseArguments()
+	config, err := parseArguments(os.Args[1:])
 	if err != nil {
 		// Help is an answer to an explicit request, not a failure.
 		if errors.Is(err, argumentParserErrors.ErrHelp) {
@@ -680,6 +699,7 @@ func main() {
 	}
 
 	vhostMux := &altshiftMux.VhostMux{HostToSpecification: hostToSpecification}
+	vhostMux.MaxStoredResponseBodySize = config.KeepResponseBody
 	if config.Verbose {
 		vhostMux.DoneCallback = func(ctx context.Context) {
 			slog.DebugContext(ctx, "An HTTP response was served.")

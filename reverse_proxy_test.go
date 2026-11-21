@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 )
 
 func TestSetForwardedHeaders(t *testing.T) {
@@ -417,6 +420,42 @@ func TestStreamRequestBody(t *testing.T) {
 			close(loggedErrors)
 			for err := range loggedErrors {
 				t.Errorf("%s: clearing the read deadline logged an error: %v", testCase.name, err)
+			}
+		})
+	}
+}
+
+func TestParseArgumentsKeepResponseBody(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		arguments []string
+		want      int
+		wantError error
+	}{
+		{name: "all of it by default", arguments: nil, want: 0},
+		{name: "a cap", arguments: []string{"--keep-response-body", "65536"}, want: 65536},
+		{name: "a cap given with an equals sign", arguments: []string{"--keep-response-body=4096"}, want: 4096},
+		{name: "a negative cap", arguments: []string{"--keep-response-body=-1"}, wantError: altshiftErrors.ErrValidationError},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			config, err := parseArguments(testCase.arguments)
+			if testCase.wantError != nil {
+				if !errors.Is(err, testCase.wantError) {
+					t.Fatalf("error = %v, want %v", err, testCase.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse arguments: %v", err)
+			}
+			if config.KeepResponseBody != testCase.want {
+				t.Errorf("keep response body = %d, want %d", config.KeepResponseBody, testCase.want)
 			}
 		})
 	}
