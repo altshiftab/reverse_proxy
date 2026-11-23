@@ -510,10 +510,12 @@ func parseArguments(arguments []string) (*CliConfig, error) {
 }
 
 // decodeUpstreamConfigurations decodes the configuration file, a map from host
-// to UpstreamConfiguration.
+// to UpstreamConfiguration. A member UpstreamConfiguration does not declare is
+// refused, so that a misspelled or miscased key fails startup rather than
+// silently leaving a vhost without the restriction it names.
 func decodeUpstreamConfigurations(data []byte) (map[string]*UpstreamConfiguration, error) {
 	var hostToUpstreamConfiguration map[string]*UpstreamConfiguration
-	if err := json.Unmarshal(data, &hostToUpstreamConfiguration); err != nil {
+	if err := json.Unmarshal(data, &hostToUpstreamConfiguration, json.RejectUnknownMembers(true)); err != nil {
 		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("json unmarshal: %w", err))
 	}
 

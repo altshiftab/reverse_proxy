@@ -494,20 +494,16 @@ func TestProxyForwardedHeaders(t *testing.T) {
 }
 
 // TestDecodeUpstreamConfigurations decodes one vhost of every shape the
-// deployments' config.json files use, so that a renamed tag, or a decoding
-// option that refuses a key they carry, fails here rather than at startup.
+// deployments' config.json files use, so that a renamed tag fails here rather
+// than at startup.
 func TestDecodeUpstreamConfigurations(t *testing.T) {
 	t.Parallel()
 
-	// "host" is no member of UpstreamConfiguration, and one deployed vhost
-	// carries it: json.RejectUnknownMembers would refuse this configuration
-	// until it is removed there.
 	const data = `{
 		"open.example": {"url": "http://open:8080"},
 		"client-authentication.example": {"url": "http://client-authentication:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem"},
 		"stream-request-body.example": {"url": "http://stream-request-body:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "stream_request_body": true},
 		"write-common-names.example": {"url": "http://write-common-names:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "write_common_names": ["capa_registry"]},
-		"host.example": {"url": "http://host:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "write_common_names": ["capa_browser"], "host": "host.example"},
 		"client-common-names.example": {"url": "http://client-common-names:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "client_common_names": ["capa_browser"]},
 		"redirect.example": {"url": "https://elsewhere.example", "redirect": true}
 	}`
@@ -545,11 +541,6 @@ func TestDecodeUpstreamConfigurations(t *testing.T) {
 			expected: &UpstreamConfiguration{Url: "http://write-common-names:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", WriteCommonNames: []string{"capa_registry"}},
 		},
 		{
-			name:     "an undeclared host key is ignored",
-			host:     "host.example",
-			expected: &UpstreamConfiguration{Url: "http://host:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", WriteCommonNames: []string{"capa_browser"}},
-		},
-		{
 			name:     "client common names",
 			host:     "client-common-names.example",
 			expected: &UpstreamConfiguration{Url: "http://client-common-names:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", ClientCommonNames: []string{"capa_browser"}},
@@ -571,6 +562,42 @@ func TestDecodeUpstreamConfigurations(t *testing.T) {
 
 			if got := configurations[testCase.host]; !reflect.DeepEqual(got, testCase.expected) {
 				t.Errorf("%s: decoded %+v, want %+v", testCase.name, got, testCase.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeUpstreamConfigurationsRefusesUnknownMembers(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		key  string
+	}{
+		// The case alone hides it from the field, and the vhost would be
+		// served without client authentication.
+		{name: "a miscased key", key: "Use_Client_Authentication"},
+		{name: "a misspelled key", key: "write_common_name"},
+		{name: "a key that was never a member", key: "host"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := `{"vhost.example": {"url": "http://upstream:8080", "` + testCase.key + `": true}}`
+
+			configurations, err := decodeUpstreamConfigurations([]byte(data))
+			if err == nil {
+				t.Fatalf("%s: decoded %v, want an error", testCase.name, configurations)
+			}
+
+			if !errors.Is(err, json.ErrUnknownName) {
+				t.Errorf("%s: error = %v, want json.ErrUnknownName", testCase.name, err)
+			}
+
+			if !strings.Contains(err.Error(), `"`+testCase.key+`"`) {
+				t.Errorf("%s: error does not name %q: %v", testCase.name, testCase.key, err)
 			}
 		})
 	}
