@@ -435,8 +435,10 @@ func TestParseArgumentsKeepResponseBody(t *testing.T) {
 		want      int
 		wantError error
 	}{
-		{name: "all of it by default", arguments: nil, want: 0},
-		{name: "a cap", arguments: []string{"--keep-response-body", "65536"}, want: 65536},
+		// Zero holds every byte of a large download in memory until it ends.
+		{name: "a 64 KiB cap by default", arguments: nil, want: 65536},
+		{name: "a cap", arguments: []string{"--keep-response-body", "8192"}, want: 8192},
+		{name: "zero keeps all of it", arguments: []string{"--keep-response-body=0"}, want: 0},
 		{name: "a cap given with an equals sign", arguments: []string{"--keep-response-body=4096"}, want: 4096},
 		{name: "a negative cap", arguments: []string{"--keep-response-body=-1"}, wantError: altshiftErrors.ErrValidationError},
 	}

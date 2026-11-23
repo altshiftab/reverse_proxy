@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	argumentParser "github.com/altshiftab/utils_go/pkg/cli/argument_parser"
@@ -32,6 +33,9 @@ import (
 )
 
 const programName = "reverse_proxy"
+
+// defaultKeepResponseBody is the --keep-response-body the deployments run with.
+const defaultKeepResponseBody = 64 << 10
 
 // errNoUpstreamConfiguration fails the handshake for a server name that is not
 // configured, rather than serving it something it did not ask for.
@@ -288,7 +292,7 @@ func parseArguments(arguments []string) (*CliConfig, error) {
 					&config.KeepResponseBody,
 				),
 				"BYTES",
-			), "0"),
+			), strconv.Itoa(defaultKeepResponseBody)),
 		},
 	}
 
