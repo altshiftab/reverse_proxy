@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	argumentParser "github.com/altshiftab/utils_go/pkg/cli/argument_parser"
@@ -215,6 +216,73 @@ func authorizeWrites(handler http.Handler, allowedCommonNames []string) http.Han
 	})
 }
 
+// forwardedValue renders an RFC 7239 parameter value: as it is when it is a
+// token, otherwise as a quoted-string, so that a host with a port stays one
+// value rather than reading as more parameters.
+func forwardedValue(value string) string {
+	if value != "" && strings.Trim(value, forwardedTokenCharacters) == "" {
+		return value
+	}
+
+	var builder strings.Builder
+	builder.WriteByte('"')
+	for i := range len(value) {
+		if value[i] == '"' || value[i] == '\\' {
+			builder.WriteByte('\\')
+		}
+		builder.WriteByte(value[i])
+	}
+	builder.WriteByte('"')
+
+	return builder.String()
+}
+
+// forwardedTokenCharacters are RFC 9110's tchar.
+const forwardedTokenCharacters = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// hostPortIsNumeric reports whether an authority's port, where it has one, is
+// digits only, as RFC 3986 has it. net.SplitHostPort accepts any port, and a
+// Host of "a.example:1;for=10.0.0.1" still routes to a.example.
+func hostPortIsNumeric(authority string) bool {
+	port := ""
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		if end < 0 {
+			return false
+		}
+
+		rest := authority[end+1:]
+		if rest == "" {
+			return true
+		}
+
+		var found bool
+		if port, found = strings.CutPrefix(rest, ":"); !found {
+			return false
+		}
+	} else {
+		var found bool
+		if _, port, found = strings.Cut(authority, ":"); !found {
+			return true
+		}
+	}
+
+	return strings.Trim(port, "0123456789") == ""
+}
+
+// rejectMalformedHost refuses a request whose Host has a port that is not a
+// number, before the Host is routed on or copied into a forwarded header.
+func rejectMalformedHost(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if !hostPortIsNumeric(request.Host) {
+			responseWriter.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		handler.ServeHTTP(responseWriter, request)
+	})
+}
+
 // setForwardedHeaders populates the Forwarded (RFC 7239) and X-Forwarded-*
 // headers on outbound from what inbound says about the client. They are set
 // rather than appended: this is the first hop, so whatever the client claimed
@@ -233,16 +301,16 @@ func setForwardedHeaders(outbound *http.Request, inbound *http.Request) {
 
 	requestHost := inbound.Host
 
-	// Per RFC 7239, IPv6 addresses in the Forwarded header must be bracketed
-	// and quoted (e.g. for="[2001:db8::1]").
+	// Per RFC 7239 an IPv6 address is bracketed, which forwardedValue then
+	// quotes (for="[2001:db8::1]").
 	forwardedFor := clientIp
-	if ip := net.ParseIP(clientIp); ip != nil && ip.To4() == nil {
-		forwardedFor = fmt.Sprintf("%q", "["+clientIp+"]")
+	if strings.Contains(clientIp, ":") {
+		forwardedFor = "[" + clientIp + "]"
 	}
 
-	forwardedString := fmt.Sprintf("for=%s;proto=%s", forwardedFor, proto)
+	forwardedString := fmt.Sprintf("for=%s;proto=%s", forwardedValue(forwardedFor), proto)
 	if requestHost != "" {
-		forwardedString += fmt.Sprintf(";host=%s", requestHost)
+		forwardedString += ";host=" + forwardedValue(requestHost)
 	}
 
 	requestHeader := outbound.Header
@@ -740,6 +808,7 @@ func main() {
 			logError,
 		)
 	}
+	rootHandler = rejectMalformedHost(rootHandler)
 
 	server := newHttpServer(serverAddress, rootHandler, newServerTlsConfig(hostToTlsConfig))
 

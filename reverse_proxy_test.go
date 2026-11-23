@@ -79,6 +79,35 @@ func TestSetForwardedHeaders(t *testing.T) {
 			unsetHeaders: []string{"X-Forwarded-Host"},
 		},
 		{
+			// A colon is not a token character, so unquoted the port would
+			// not parse as part of the value.
+			name:       "a host with a port is quoted in forwarded only",
+			host:       "example.com:8443",
+			remoteAddr: "192.0.2.10:54321",
+			expectedHeaders: map[string]string{
+				"Forwarded":        `for=192.0.2.10;proto=http;host="example.com:8443"`,
+				"X-Forwarded-Host": "example.com:8443",
+			},
+		},
+		{
+			name:       "an ipv6 host is quoted",
+			host:       "[2001:db8::2]:8443",
+			remoteAddr: "[2001:db8::1]:54321",
+			expectedHeaders: map[string]string{
+				"Forwarded": `for="[2001:db8::1]";proto=http;host="[2001:db8::2]:8443"`,
+			},
+		},
+		{
+			// net.ParseIP refuses a zone, which left this unbracketed.
+			name:       "an ipv6 address with a zone is bracketed",
+			host:       "example.com",
+			remoteAddr: "[fe80::1%eth0]:54321",
+			expectedHeaders: map[string]string{
+				"Forwarded":       `for="[fe80::1%eth0]";proto=http;host=example.com`,
+				"X-Forwarded-For": "fe80::1%eth0",
+			},
+		},
+		{
 			// Whatever the client claimed must be replaced, never appended to.
 			name:       "client supplied values are replaced",
 			host:       "example.com",
@@ -137,6 +166,58 @@ func TestSetForwardedHeaders(t *testing.T) {
 	}
 }
 
+func TestRejectMalformedHost(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		host         string
+		expectServed bool
+	}{
+		{name: "a name", host: "upload-logs.home.arpa", expectServed: true},
+		{name: "a name and a port", host: "upload-logs.home.arpa:443", expectServed: true},
+		// RFC 3986 allows an empty port, and it carries nothing.
+		{name: "an empty port", host: "upload-logs.home.arpa:", expectServed: true},
+		{name: "an ipv6 address", host: "[2001:db8::1]", expectServed: true},
+		{name: "an ipv6 address and a port", host: "[2001:db8::1]:443", expectServed: true},
+		// The mux refuses this one, having no vhost for it.
+		{name: "no host", host: "", expectServed: true},
+		{name: "a parameter in the port", host: "restic.home.arpa:1;for=10.0.0.1"},
+		{name: "an element in the port", host: "restic.home.arpa:1,for=10.0.0.1"},
+		{name: "a name in the port", host: "restic.home.arpa:https"},
+		{name: "two ports", host: "restic.home.arpa:1:2"},
+		{name: "an unbracketed ipv6 address", host: "2001:db8::1"},
+		{name: "a non-numeric port after an ipv6 address", host: "[2001:db8::1]:x"},
+		{name: "text after an ipv6 address", host: "[2001:db8::1]x"},
+		{name: "an unterminated bracket", host: "[2001:db8::1"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var served bool
+			handler := rejectMalformedHost(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				served = true
+			}))
+
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+			request.Host = testCase.host
+
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+
+			if served != testCase.expectServed {
+				t.Errorf("%s: served = %v, want %v", testCase.name, served, testCase.expectServed)
+			}
+
+			if !testCase.expectServed && recorder.Code != http.StatusBadRequest {
+				t.Errorf("%s: status = %d, want %d", testCase.name, recorder.Code, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
 // newTestProxy builds the proxy exactly as main does, so the test exercises the
 // real Rewrite hook rather than a copy of it.
 func newTestProxy(target *url.URL) *httputil.ReverseProxy {
@@ -157,23 +238,36 @@ func TestProxyForwardedHeaders(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name             string
-		inboundHost      string
-		inboundForwarded string
-		expectedHost     string
+		name              string
+		inboundHost       string
+		inboundForwarded  string
+		expectedForwarded string
+		// expectRefused is a request the upstream must never see.
+		expectRefused bool
 	}{
 		{
-			name:         "the client address appears once",
-			inboundHost:  "vhost.example",
-			expectedHost: "vhost.example",
+			name:              "the client address appears once",
+			inboundHost:       "vhost.example",
+			expectedForwarded: "for=127.0.0.1;proto=http;host=vhost.example",
 		},
 		{
 			// Regression: with a Director, ReverseProxy appended the client
 			// address to the one already set, sending it upstream twice.
-			name:             "a client supplied value is dropped, not appended",
-			inboundHost:      "vhost.example",
-			inboundForwarded: "203.0.113.9",
-			expectedHost:     "vhost.example",
+			name:              "a client supplied value is dropped, not appended",
+			inboundHost:       "vhost.example",
+			inboundForwarded:  "203.0.113.9",
+			expectedForwarded: "for=127.0.0.1;proto=http;host=vhost.example",
+		},
+		{
+			name:              "a host with a port reaches the upstream quoted",
+			inboundHost:       "vhost.example:8443",
+			expectedForwarded: `for=127.0.0.1;proto=http;host="vhost.example:8443"`,
+		},
+		{
+			// This arrived as for=127.0.0.1;proto=http;host=vhost.example:1;for=10.0.0.1.
+			name:          "a host smuggling a client address is refused",
+			inboundHost:   "vhost.example:1;for=10.0.0.1",
+			expectRefused: true,
 		},
 	}
 
@@ -181,11 +275,13 @@ func TestProxyForwardedHeaders(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
+			var reached bool
 			var seenForwardedFor string
 			var seenForwarded string
 			var seenHost string
 
 			upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+				reached = true
 				seenForwardedFor = request.Header.Get("X-Forwarded-For")
 				seenForwarded = request.Header.Get("Forwarded")
 				seenHost = request.Host
@@ -197,7 +293,7 @@ func TestProxyForwardedHeaders(t *testing.T) {
 				t.Fatalf("parse upstream url: %v", err)
 			}
 
-			front := httptest.NewServer(newTestProxy(target))
+			front := httptest.NewServer(rejectMalformedHost(newTestProxy(target)))
 			defer front.Close()
 
 			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, front.URL, nil)
@@ -217,20 +313,26 @@ func TestProxyForwardedHeaders(t *testing.T) {
 				_ = response.Body.Close()
 			}()
 
+			if testCase.expectRefused {
+				if reached || response.StatusCode != http.StatusBadRequest {
+					t.Errorf("%s: status = %d and upstream reached = %v, want a 400 it never saw", testCase.name, response.StatusCode, reached)
+				}
+				return
+			}
+
 			if seenForwardedFor != "127.0.0.1" {
-				t.Errorf("upstream saw X-Forwarded-For %q, want a single \"127.0.0.1\"", seenForwardedFor)
+				t.Errorf("%s: upstream saw X-Forwarded-For %q, want a single \"127.0.0.1\"", testCase.name, seenForwardedFor)
 			}
 
 			// The RFC 7239 header travels alongside the X-Forwarded-* ones.
-			expectedForwarded := "for=127.0.0.1;proto=http;host=" + testCase.inboundHost
-			if seenForwarded != expectedForwarded {
-				t.Errorf("upstream saw Forwarded %q, want %q", seenForwarded, expectedForwarded)
+			if seenForwarded != testCase.expectedForwarded {
+				t.Errorf("%s: upstream saw Forwarded %q, want %q", testCase.name, seenForwarded, testCase.expectedForwarded)
 			}
 
 			// SetURL points Host at the upstream; the host the client asked for
 			// has to survive for the upstream to route on it.
-			if seenHost != testCase.expectedHost {
-				t.Errorf("upstream saw Host %q, want %q", seenHost, testCase.expectedHost)
+			if seenHost != testCase.inboundHost {
+				t.Errorf("%s: upstream saw Host %q, want %q", testCase.name, seenHost, testCase.inboundHost)
 			}
 		})
 	}
