@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -265,16 +266,21 @@ func forwardedValue(value string) string {
 // tchars are the characters RFC 9110 allows in a token.
 const tchars = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// hostPortIsNumeric reports whether an authority's port, where it has one, is
-// digits only, as RFC 3986 has it. net.SplitHostPort accepts any port, and a
-// Host of "a.example:1;for=10.0.0.1" still routes to a.example.
-func hostPortIsNumeric(authority string) bool {
+// authorityIsWellFormed reports whether an authority's port, where it has one,
+// is digits only, and its brackets, where it has them, hold an IPv6 address, as
+// RFC 3986 has it. net.SplitHostPort accepts any port, and a Host of
+// "a.example:1;for=10.0.0.1" or "[a.example]" would otherwise reach a.example.
+func authorityIsWellFormed(authority string) bool {
 	var port string
 	var found bool
 
 	if strings.HasPrefix(authority, "[") {
 		end := strings.IndexByte(authority, ']')
 		if end < 0 {
+			return false
+		}
+
+		if address, err := netip.ParseAddr(authority[1:end]); err != nil || !address.Is6() {
 			return false
 		}
 
@@ -297,19 +303,19 @@ func hostPortIsNumeric(authority string) bool {
 // fill a log line.
 const maxLoggedHostLength = 256
 
-// rejectMalformedHost refuses a request whose Host has a port that is not a
-// number, before the Host is routed on or copied into a forwarded header. It
+// rejectMalformedHost refuses a request whose Host authorityIsWellFormed
+// refuses, before the Host is routed on or copied into a forwarded header. It
 // logs the refusal itself, since the mux that logs the others never sees it.
 func rejectMalformedHost(handler http.Handler, logWarning func(string, ...any)) http.Handler {
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
-		if !hostPortIsNumeric(request.Host) {
+		if !authorityIsWellFormed(request.Host) {
 			host := request.Host
 			if len(host) > maxLoggedHostLength {
 				host = host[:maxLoggedHostLength]
 			}
 
 			logWarning(
-				"A request whose host has a malformed port was refused.",
+				"A request with a malformed host was refused.",
 				slog.Group("source", slog.String("address", request.RemoteAddr)),
 				slog.Group("url", slog.String("domain", host)),
 			)

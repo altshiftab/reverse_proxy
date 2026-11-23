@@ -210,6 +210,12 @@ func TestRejectMalformedHost(t *testing.T) {
 		{name: "a non-numeric port after an ipv6 address", host: "[2001:db8::1]:x"},
 		{name: "text after an ipv6 address", host: "[2001:db8::1]x"},
 		{name: "an unterminated bracket", host: "[2001:db8::1"},
+		{name: "an ipv6 address with a zone", host: "[fe80::1%25eth0]:443", expectServed: true},
+		// Brackets hold an IPv6 address and nothing else.
+		{name: "a name in brackets", host: "[restic.home.arpa]"},
+		{name: "a name in brackets and a port", host: "[restic.home.arpa]:443"},
+		{name: "an ipv4 address in brackets", host: "[192.0.2.1]"},
+		{name: "empty brackets", host: "[]:443"},
 		{name: "a long malformed host", host: "restic.home.arpa:1;" + strings.Repeat("a", 4096)},
 	}
 
@@ -290,6 +296,14 @@ func TestNewRootHandler(t *testing.T) {
 			expectStatus:         http.StatusOK,
 			expectServed:         true,
 			expectDeadlineLifted: true,
+		},
+		{
+			// The mux would answer 421; this is refused, and logged, before it.
+			name:                 "a name in brackets is refused before the mux",
+			serverName:           openHost,
+			host:                 "[" + openHost + "]:443",
+			expectStatus:         http.StatusBadRequest,
+			expectWarningsLogged: true,
 		},
 		{
 			// Refused before streamRequestBody, which would route it to the
