@@ -2,4 +2,4 @@ module github.com/altshiftab/reverse_proxy
 
 go 1.27
 
-require github.com/altshiftab/utils_go v1.121.0
+require github.com/altshiftab/utils_go v1.123.0
