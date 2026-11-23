@@ -247,7 +247,7 @@ func authorizeWrites(handler http.Handler, allowedCommonNames []string) http.Han
 // token, otherwise as a quoted-string, so that a host with a port stays one
 // value rather than reading as more parameters.
 func forwardedValue(value string) string {
-	if value != "" && strings.Trim(value, forwardedTokenCharacters) == "" {
+	if value != "" && strings.Trim(value, tchars) == "" {
 		return value
 	}
 
@@ -264,14 +264,16 @@ func forwardedValue(value string) string {
 	return builder.String()
 }
 
-// forwardedTokenCharacters are RFC 9110's tchar.
-const forwardedTokenCharacters = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+// tchars are the characters RFC 9110 allows in a token.
+const tchars = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 // hostPortIsNumeric reports whether an authority's port, where it has one, is
 // digits only, as RFC 3986 has it. net.SplitHostPort accepts any port, and a
 // Host of "a.example:1;for=10.0.0.1" still routes to a.example.
 func hostPortIsNumeric(authority string) bool {
-	port := ""
+	var port string
+	var found bool
+
 	if strings.HasPrefix(authority, "[") {
 		end := strings.IndexByte(authority, ']')
 		if end < 0 {
@@ -283,15 +285,11 @@ func hostPortIsNumeric(authority string) bool {
 			return true
 		}
 
-		var found bool
 		if port, found = strings.CutPrefix(rest, ":"); !found {
 			return false
 		}
-	} else {
-		var found bool
-		if _, port, found = strings.Cut(authority, ":"); !found {
-			return true
-		}
+	} else if _, port, found = strings.Cut(authority, ":"); !found {
+		return true
 	}
 
 	return strings.Trim(port, "0123456789") == ""
