@@ -41,6 +41,10 @@ const (
 	readHeaderTimeout = 10 * time.Second
 	readTimeout       = 60 * time.Second
 	idleTimeout       = 120 * time.Second
+	// maxHeaderBytes replaces net/http's 1 MiB default, which let one request
+	// put a megabyte of headers into a log line; Kibana and Synapse refuse more
+	// than 16 KiB themselves.
+	maxHeaderBytes = 64 << 10
 )
 
 type UpstreamConfiguration struct {
@@ -384,6 +388,23 @@ func newServerTlsConfig(hostToTlsConfig map[string]*tls.Config) *tls.Config {
 	}
 }
 
+// newHttpServer returns the server main listens with.
+func newHttpServer(serverAddress string, handler http.Handler, tlsConfig *tls.Config) *http.Server {
+	return &http.Server{
+		Addr:    serverAddress,
+		Handler: handler,
+		// Without these a client can hold a connection, or a request, open for
+		// as long as it likes. WriteTimeout is left unset: a proxied response
+		// takes as long as its upstream does, and ReadTimeout is lifted per host
+		// by streamRequestBody for an upstream whose clients stream one.
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+		TLSConfig:         tlsConfig,
+	}
+}
+
 func main() {
 	config, err := parseArguments(os.Args[1:])
 	if err != nil {
@@ -716,18 +737,7 @@ func main() {
 		)
 	}
 
-	server := &http.Server{
-		Addr:    serverAddress,
-		Handler: rootHandler,
-		// Without these a client can hold a connection, or a request, open for
-		// as long as it likes. WriteTimeout is left unset: a proxied response
-		// takes as long as its upstream does, and ReadTimeout is lifted per host
-		// by streamRequestBody for an upstream whose clients stream one.
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		IdleTimeout:       idleTimeout,
-		TLSConfig:         newServerTlsConfig(hostToTlsConfig),
-	}
+	server := newHttpServer(serverAddress, rootHandler, newServerTlsConfig(hostToTlsConfig))
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		logFatal(

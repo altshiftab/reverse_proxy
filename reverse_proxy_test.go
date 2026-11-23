@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -456,6 +457,49 @@ func TestParseArgumentsKeepResponseBody(t *testing.T) {
 			}
 			if config.KeepResponseBody != testCase.want {
 				t.Errorf("keep response body = %d, want %d", config.KeepResponseBody, testCase.want)
+			}
+		})
+	}
+}
+
+func TestNewHttpServerCapsRequestHeaders(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewUnstartedServer(nil)
+	server.Config = newHttpServer("", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil)
+	server.Start()
+	// Not defer: the subtests below are parallel, so they run after this
+	// function returns.
+	t.Cleanup(server.Close)
+
+	testCases := []struct {
+		name         string
+		headerSize   int
+		expectStatus int
+	}{
+		{name: "headers under the cap are served", headerSize: 32 << 10, expectStatus: http.StatusOK},
+		// net/http's default of 1 MiB admits this one.
+		{name: "headers over the cap are refused", headerSize: 128 << 10, expectStatus: http.StatusRequestHeaderFieldsTooLarge},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Fatalf("%s: new request: %v", testCase.name, err)
+			}
+			request.Header.Set("X-Padding", strings.Repeat("a", testCase.headerSize))
+
+			response, err := server.Client().Do(request)
+			if err != nil {
+				t.Fatalf("%s: do request: %v", testCase.name, err)
+			}
+			_ = response.Body.Close()
+
+			if response.StatusCode != testCase.expectStatus {
+				t.Errorf("%s: status = %d, want %d", testCase.name, response.StatusCode, testCase.expectStatus)
 			}
 		})
 	}
