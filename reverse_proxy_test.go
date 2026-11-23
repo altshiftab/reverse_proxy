@@ -3,13 +3,13 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json/v2"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -358,35 +358,72 @@ func TestProxyForwardedHeaders(t *testing.T) {
 	}
 }
 
-func TestUpstreamConfigurationUnmarshal(t *testing.T) {
+// TestDecodeUpstreamConfigurations decodes one vhost of every shape the
+// deployments' config.json files use, so that a renamed tag, or a decoding
+// option that refuses a key they carry, fails here rather than at startup.
+func TestDecodeUpstreamConfigurations(t *testing.T) {
 	t.Parallel()
 
+	// "host" is no member of UpstreamConfiguration, and one deployed vhost
+	// carries it: json.RejectUnknownMembers would refuse this configuration
+	// until it is removed there.
 	const data = `{
-		"a.example": {"url": "http://backend-a:8080"},
-		"b.example": {"url": "https://backend-b", "use_client_authentication": true},
-		"c.example": {"url": "https://elsewhere.example", "redirect": true},
-		"d.example": {"url": "http://backend-d:9090", "stream_request_body": true}
+		"open.example": {"url": "http://open:8080"},
+		"client-authentication.example": {"url": "http://client-authentication:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem"},
+		"stream-request-body.example": {"url": "http://stream-request-body:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "stream_request_body": true},
+		"write-common-names.example": {"url": "http://write-common-names:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "write_common_names": ["capa_registry"]},
+		"host.example": {"url": "http://host:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "write_common_names": ["capa_browser"], "host": "host.example"},
+		"client-common-names.example": {"url": "http://client-common-names:8080", "use_client_authentication": true, "client_ca_file_path": "/config/ca.pem", "client_common_names": ["capa_browser"]},
+		"redirect.example": {"url": "https://elsewhere.example", "redirect": true}
 	}`
 
-	var configurations map[string]*UpstreamConfiguration
-	if err := json.Unmarshal([]byte(data), &configurations); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	configurations, err := decodeUpstreamConfigurations([]byte(data))
+	if err != nil {
+		t.Fatalf("decode upstream configurations: %v", err)
 	}
 
 	testCases := []struct {
-		name                         string
-		host                         string
-		expectedUrl                  string
-		expectedClientAuthentication bool
-		expectedRedirect             bool
-		expectedStreamRequestBody    bool
+		name     string
+		host     string
+		expected *UpstreamConfiguration
 	}{
-		{name: "plain upstream", host: "a.example", expectedUrl: "http://backend-a:8080"},
-		{name: "client authentication", host: "b.example", expectedUrl: "https://backend-b", expectedClientAuthentication: true},
-		{name: "redirect", host: "c.example", expectedUrl: "https://elsewhere.example", expectedRedirect: true},
-		// The tag name is what config.json has to spell; a typo here would
-		// silently leave the upstream on the default timeout and pooling.
-		{name: "stream request body", host: "d.example", expectedUrl: "http://backend-d:9090", expectedStreamRequestBody: true},
+		{
+			name:     "url only",
+			host:     "open.example",
+			expected: &UpstreamConfiguration{Url: "http://open:8080"},
+		},
+		{
+			name:     "client authentication",
+			host:     "client-authentication.example",
+			expected: &UpstreamConfiguration{Url: "http://client-authentication:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem"},
+		},
+		{
+			// A typo here would silently leave the upstream on the default
+			// timeout and pooling.
+			name:     "stream request body",
+			host:     "stream-request-body.example",
+			expected: &UpstreamConfiguration{Url: "http://stream-request-body:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", StreamRequestBody: true},
+		},
+		{
+			name:     "write common names",
+			host:     "write-common-names.example",
+			expected: &UpstreamConfiguration{Url: "http://write-common-names:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", WriteCommonNames: []string{"capa_registry"}},
+		},
+		{
+			name:     "an undeclared host key is ignored",
+			host:     "host.example",
+			expected: &UpstreamConfiguration{Url: "http://host:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", WriteCommonNames: []string{"capa_browser"}},
+		},
+		{
+			name:     "client common names",
+			host:     "client-common-names.example",
+			expected: &UpstreamConfiguration{Url: "http://client-common-names:8080", UseClientAuthentication: true, ClientCaFilePath: "/config/ca.pem", ClientCommonNames: []string{"capa_browser"}},
+		},
+		{
+			name:     "redirect",
+			host:     "redirect.example",
+			expected: &UpstreamConfiguration{Url: "https://elsewhere.example", Redirect: true},
+		},
 	}
 
 	if len(configurations) != len(testCases) {
@@ -397,25 +434,8 @@ func TestUpstreamConfigurationUnmarshal(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			configuration := configurations[testCase.host]
-			if configuration == nil {
-				t.Fatalf("no configuration for %s", testCase.host)
-			}
-
-			if configuration.Url != testCase.expectedUrl {
-				t.Errorf("url = %q, want %q", configuration.Url, testCase.expectedUrl)
-			}
-
-			if configuration.UseClientAuthentication != testCase.expectedClientAuthentication {
-				t.Errorf("use_client_authentication = %v, want %v", configuration.UseClientAuthentication, testCase.expectedClientAuthentication)
-			}
-
-			if configuration.Redirect != testCase.expectedRedirect {
-				t.Errorf("redirect = %v, want %v", configuration.Redirect, testCase.expectedRedirect)
-			}
-
-			if configuration.StreamRequestBody != testCase.expectedStreamRequestBody {
-				t.Errorf("stream_request_body = %v, want %v", configuration.StreamRequestBody, testCase.expectedStreamRequestBody)
+			if got := configurations[testCase.host]; !reflect.DeepEqual(got, testCase.expected) {
+				t.Errorf("%s: decoded %+v, want %+v", testCase.name, got, testCase.expected)
 			}
 		})
 	}

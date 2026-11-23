@@ -467,6 +467,17 @@ func parseArguments(arguments []string) (*CliConfig, error) {
 	return config, nil
 }
 
+// decodeUpstreamConfigurations decodes the configuration file, a map from host
+// to UpstreamConfiguration.
+func decodeUpstreamConfigurations(data []byte) (map[string]*UpstreamConfiguration, error) {
+	var hostToUpstreamConfiguration map[string]*UpstreamConfiguration
+	if err := json.Unmarshal(data, &hostToUpstreamConfiguration); err != nil {
+		return nil, altshiftErrors.NewWithTrace(fmt.Errorf("json unmarshal: %w", err))
+	}
+
+	return hostToUpstreamConfiguration, nil
+}
+
 // newHostTlsConfig builds the TLS configuration a host is served with. When the
 // host asks for client authentication, the certificates offered are pinned to
 // the configured authority: with ClientCAs left unset Go verifies against the
@@ -653,11 +664,11 @@ func main() {
 		)
 	}
 
-	var hostToUpstreamConfiguration map[string]*UpstreamConfiguration
-	if err := json.Unmarshal(configData, &hostToUpstreamConfiguration); err != nil {
+	hostToUpstreamConfiguration, err := decodeUpstreamConfigurations(configData)
+	if err != nil {
 		logFatal(
 			"An error occurred when decoding the configuration file.",
-			altshiftErrors.NewWithTrace(fmt.Errorf("json unmarshal (config): %w", err)),
+			altshiftErrors.New(fmt.Errorf("decode upstream configurations: %w", err)),
 			configData,
 		)
 	}
