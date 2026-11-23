@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -17,6 +20,8 @@ import (
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	altshiftMux "github.com/altshiftab/utils_go/pkg/http/mux"
+	altshiftEntrySizeGuard "github.com/altshiftab/utils_go/pkg/log/entry_size_guard"
+	altshiftErrorLogger "github.com/altshiftab/utils_go/pkg/log/error_logger"
 )
 
 func TestSetForwardedHeaders(t *testing.T) {
@@ -812,6 +817,77 @@ func TestNewHttpServerCapsRequestHeaders(t *testing.T) {
 
 			if response.StatusCode != testCase.expectStatus {
 				t.Errorf("%s: status = %d, want %d", testCase.name, response.StatusCode, testCase.expectStatus)
+			}
+		})
+	}
+}
+
+// errTestRefused is the error TestNewLoggerMaker logs.
+var errTestRefused = errors.New("refused")
+
+func TestNewLoggerMaker(t *testing.T) {
+	t.Parallel()
+
+	const message = "A request was refused."
+	large := strings.Repeat("a", 1<<20)
+
+	testCases := []struct {
+		name string
+		log  func(logger *altshiftErrorLogger.Logger)
+		// expectTruncated is an entry the guard had to cut to fit.
+		expectTruncated bool
+	}{
+		{
+			name: "a small entry is written as it is",
+			log: func(logger *altshiftErrorLogger.Logger) {
+				logger.Warn(message, slog.String("detail", "small"))
+			},
+		},
+		{
+			// A megabyte of Host, say, before MaxHeaderBytes bounded it.
+			name: "an oversized attribute is cut to fit",
+			log: func(logger *altshiftErrorLogger.Logger) {
+				logger.Warn(message, slog.String("detail", large))
+			},
+			expectTruncated: true,
+		},
+		{
+			name: "an oversized error input is cut to fit",
+			log: func(logger *altshiftErrorLogger.Logger) {
+				logger.Error(message, errTestRefused, large)
+			},
+			expectTruncated: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var output bytes.Buffer
+			makeLogger := newLoggerMaker(&output, slog.LevelDebug)
+			testCase.log(makeLogger(slog.String("dataset", "reverse_proxy")))
+
+			line := bytes.TrimSuffix(output.Bytes(), []byte("\n"))
+			if len(line) == 0 || bytes.Contains(line, []byte("\n")) {
+				t.Fatalf("%s: want one entry, got %q", testCase.name, output.String())
+			}
+
+			if len(line) > altshiftEntrySizeGuard.DefaultEntryLimit {
+				t.Errorf("%s: entry is %d bytes, over the %d limit", testCase.name, len(line), altshiftEntrySizeGuard.DefaultEntryLimit)
+			}
+
+			var entry map[string]any
+			if err := json.Unmarshal(line, &entry); err != nil {
+				t.Fatalf("%s: entry does not parse: %v", testCase.name, err)
+			}
+
+			if truncated := entry[altshiftEntrySizeGuard.TruncatedKey] == true; truncated != testCase.expectTruncated {
+				t.Errorf("%s: truncated = %v, want %v", testCase.name, truncated, testCase.expectTruncated)
+			}
+
+			if !bytes.Contains(line, []byte(message)) {
+				t.Errorf("%s: the message is lost: %s", testCase.name, line)
 			}
 		})
 	}

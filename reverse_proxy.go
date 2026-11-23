@@ -7,6 +7,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 	"github.com/altshiftab/utils_go/pkg/http/types/http_context_extractor"
 	altshiftLog "github.com/altshiftab/utils_go/pkg/log"
 	altshiftContextLogger "github.com/altshiftab/utils_go/pkg/log/context_logger"
+	altshiftEntrySizeGuard "github.com/altshiftab/utils_go/pkg/log/entry_size_guard"
 	altshiftErrorLogger "github.com/altshiftab/utils_go/pkg/log/error_logger"
 	schemaLog "github.com/altshiftab/utils_go/pkg/schema/log"
 )
@@ -613,6 +615,31 @@ func newHttpServer(serverAddress string, handler http.Handler, tlsConfig *tls.Co
 	}
 }
 
+// newLoggerMaker returns what main makes its loggers with: each writes JSON
+// entries to output through one entry_size_guard, so that what a client puts in
+// a request cannot make an entry of any size.
+func newLoggerMaker(output io.Writer, logLevel slog.Level) func(eventAttrs ...any) *altshiftErrorLogger.Logger {
+	guardedOutput := altshiftEntrySizeGuard.New(output)
+	httpContextExtractor := &http_context_extractor.Extractor{}
+
+	return func(eventAttrs ...any) *altshiftErrorLogger.Logger {
+		return &altshiftErrorLogger.Logger{
+			Logger: altshiftContextLogger.New(
+				slog.NewJSONHandler(
+					guardedOutput,
+					&slog.HandlerOptions{Level: logLevel, ReplaceAttr: schemaLog.ReplaceAttr},
+				),
+				&altshiftLog.ErrorContextExtractor{
+					ContextExtractors: []altshiftLog.ContextExtractor{
+						httpContextExtractor,
+					},
+				},
+				httpContextExtractor,
+			).With(slog.Group("event", eventAttrs...)),
+		}
+	}
+}
+
 func main() {
 	config, err := parseArguments(os.Args[1:])
 	if err != nil {
@@ -630,23 +657,7 @@ func main() {
 		logLevel = slog.LevelDebug
 	}
 
-	httpContextExtractor := &http_context_extractor.Extractor{}
-	makeLogger := func(eventAttrs ...any) *altshiftErrorLogger.Logger {
-		return &altshiftErrorLogger.Logger{
-			Logger: altshiftContextLogger.New(
-				slog.NewJSONHandler(
-					os.Stdout,
-					&slog.HandlerOptions{Level: logLevel, ReplaceAttr: schemaLog.ReplaceAttr},
-				),
-				&altshiftLog.ErrorContextExtractor{
-					ContextExtractors: []altshiftLog.ContextExtractor{
-						httpContextExtractor,
-					},
-				},
-				httpContextExtractor,
-			).With(slog.Group("event", eventAttrs...)),
-		}
-	}
+	makeLogger := newLoggerMaker(os.Stdout, logLevel)
 
 	logger := makeLogger(slog.String("dataset", "reverse_proxy"))
 	slog.SetDefault(logger.Logger)
