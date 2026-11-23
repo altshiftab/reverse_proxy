@@ -26,6 +26,7 @@ func TestAuthorizeWrites(t *testing.T) {
 		name               string
 		allowedCommonNames []string
 		method             string
+		header             http.Header
 		connectionState    *tls.ConnectionState
 		expectedForwarded  bool
 		expectedStatusCode int
@@ -122,6 +123,45 @@ func TestAuthorizeWrites(t *testing.T) {
 			expectedStatusCode: http.StatusForbidden,
 		},
 		{
+			// A 101 hands the client a tunnel to the upstream, PUT and all.
+			name:               "upgrade from a disallowed name",
+			allowedCommonNames: allowed,
+			method:             http.MethodGet,
+			header:             http.Header{"Connection": []string{"Upgrade"}, "Upgrade": []string{"websocket"}},
+			connectionState:    clientState("glory_registry"),
+			expectedForwarded:  false,
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			name:               "h2c upgrade from a disallowed name",
+			allowedCommonNames: allowed,
+			method:             http.MethodGet,
+			header:             http.Header{"Connection": []string{"Upgrade, HTTP2-Settings"}, "Upgrade": []string{"h2c"}},
+			connectionState:    clientState("glory_registry"),
+			expectedForwarded:  false,
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			// Refused even without the Connection token that makes ReverseProxy
+			// act on it, rather than reasoning about which upgrades it honours.
+			name:               "upgrade header alone from a disallowed name",
+			allowedCommonNames: allowed,
+			method:             http.MethodHead,
+			header:             http.Header{"Upgrade": []string{"websocket"}},
+			connectionState:    clientState("glory_registry"),
+			expectedForwarded:  false,
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			name:               "upgrade from an allowed name",
+			allowedCommonNames: allowed,
+			method:             http.MethodGet,
+			header:             http.Header{"Connection": []string{"Upgrade"}, "Upgrade": []string{"websocket"}},
+			connectionState:    clientState("capa_registry"),
+			expectedForwarded:  true,
+			expectedStatusCode: http.StatusOK,
+		},
+		{
 			name:               "empty allow list still permits reads",
 			allowedCommonNames: nil,
 			method:             http.MethodGet,
@@ -147,6 +187,9 @@ func TestAuthorizeWrites(t *testing.T) {
 				"/v2/thing/blobs/uploads/",
 				nil,
 			)
+			for name, values := range testCase.header {
+				request.Header[name] = values
+			}
 			request.TLS = testCase.connectionState
 
 			recorder := httptest.NewRecorder()

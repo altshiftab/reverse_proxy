@@ -185,6 +185,18 @@ var safeMethods = map[string]struct{}{
 	http.MethodOptions: {},
 }
 
+// isRead reports whether authorizeWrites may pass request without a write
+// permission. A request asking to upgrade never is one: after a 101
+// ReverseProxy relays raw bytes both ways, in which any method can follow.
+func isRead(request *http.Request) bool {
+	if len(request.Header.Values("Upgrade")) != 0 {
+		return false
+	}
+
+	_, ok := safeMethods[request.Method]
+	return ok
+}
+
 // authorizeWrites returns a handler admitting state-changing requests only from
 // the client certificates named in allowedCommonNames, while leaving reads to
 // every client the vhost's client authentication already admitted.
@@ -202,7 +214,7 @@ func authorizeWrites(handler http.Handler, allowedCommonNames []string) http.Han
 	allowed := commonNameSet(allowedCommonNames)
 
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
-		if _, ok := safeMethods[request.Method]; ok {
+		if isRead(request) {
 			handler.ServeHTTP(responseWriter, request)
 			return
 		}
