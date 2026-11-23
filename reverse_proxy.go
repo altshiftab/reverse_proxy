@@ -283,11 +283,22 @@ func rejectMalformedHost(handler http.Handler) http.Handler {
 	})
 }
 
+// clientClaimedHeaders are headers upstreams take a client's address or the
+// public URL from that this proxy does not set, so a client's own value would
+// pass as the proxy's.
+var clientClaimedHeaders = []string{
+	"X-Real-IP",
+	"True-Client-IP",
+	"CF-Connecting-IP",
+	"X-Forwarded-Port",
+	"X-Forwarded-Prefix",
+}
+
 // setForwardedHeaders populates the Forwarded (RFC 7239) and X-Forwarded-*
-// headers on outbound from what inbound says about the client. They are set
-// rather than appended: this is the first hop, so whatever the client claimed
-// is not to be trusted or carried forward. The caller must ensure that both
-// requests and outbound.Header are non-nil.
+// headers on outbound from what inbound says about the client, and drops
+// clientClaimedHeaders. They are set rather than appended: this is the first
+// hop, so whatever the client claimed is not to be trusted or carried forward.
+// The caller must ensure that both requests and outbound.Header are non-nil.
 func setForwardedHeaders(outbound *http.Request, inbound *http.Request) {
 	proto := "http"
 	if inbound.TLS != nil {
@@ -320,6 +331,53 @@ func setForwardedHeaders(outbound *http.Request, inbound *http.Request) {
 
 	if requestHost != "" {
 		requestHeader.Set("X-Forwarded-Host", requestHost)
+	}
+
+	for _, name := range clientClaimedHeaders {
+		requestHeader.Del(name)
+	}
+}
+
+// newRewrite returns the ReverseProxy Rewrite hook for the upstream at target.
+//
+// Rewrite rather than Director: ReverseProxy appends the client address to
+// X-Forwarded-For itself when a Director is used, which duplicated the address
+// this already set. Rewrite leaves the header entirely to this function.
+func newRewrite(target *url.URL, logError func(string, error, ...any)) func(*httputil.ProxyRequest) {
+	return func(proxyRequest *httputil.ProxyRequest) {
+		if proxyRequest == nil {
+			logError(
+				"Empty proxy request.",
+				altshiftErrors.NewWithTrace(nil_error.New("proxy request")),
+			)
+			return
+		}
+
+		inbound := proxyRequest.In
+		outbound := proxyRequest.Out
+		if inbound == nil || outbound == nil {
+			logError(
+				"Empty HTTP request.",
+				altshiftErrors.NewWithTrace(nil_error.New("http request")),
+			)
+			return
+		}
+
+		proxyRequest.SetURL(target)
+		// SetURL points Host at the upstream. The upstream is addressed by name
+		// here, so the host the client asked for has to be put back for it to
+		// route on.
+		outbound.Host = inbound.Host
+
+		if outbound.Header == nil {
+			logError(
+				"Empty HTTP request header.",
+				altshiftErrors.NewWithTrace(nil_error.New("http request header")),
+			)
+			return
+		}
+
+		setForwardedHeaders(outbound, inbound)
 	}
 }
 
@@ -720,47 +778,7 @@ func main() {
 		if upstreamConfiguration.Redirect {
 			specification = &altshiftMux.VhostMuxSpecification{RedirectTo: upstreamUrl}
 		} else {
-			// Rewrite rather than Director: ReverseProxy appends the client
-			// address to X-Forwarded-For itself when a Director is used, which
-			// duplicated the address this already set. Rewrite leaves the header
-			// entirely to this function.
-			proxy := &httputil.ReverseProxy{
-				Rewrite: func(proxyRequest *httputil.ProxyRequest) {
-					if proxyRequest == nil {
-						logError(
-							"Empty proxy request.",
-							altshiftErrors.NewWithTrace(nil_error.New("proxy request")),
-						)
-						return
-					}
-
-					inbound := proxyRequest.In
-					outbound := proxyRequest.Out
-					if inbound == nil || outbound == nil {
-						logError(
-							"Empty HTTP request.",
-							altshiftErrors.NewWithTrace(nil_error.New("http request")),
-						)
-						return
-					}
-
-					proxyRequest.SetURL(target)
-					// SetURL points Host at the upstream. The upstream is addressed
-					// by name here, so the host the client asked for has to be put
-					// back for it to route on.
-					outbound.Host = inbound.Host
-
-					if outbound.Header == nil {
-						logError(
-							"Empty HTTP request header.",
-							altshiftErrors.NewWithTrace(nil_error.New("http request header")),
-						)
-						return
-					}
-
-					setForwardedHeaders(outbound, inbound)
-				},
-			}
+			proxy := &httputil.ReverseProxy{Rewrite: newRewrite(target, logError)}
 
 			proxyLogger := makeLogger(
 				slog.String("dataset", "reverse_proxy"),

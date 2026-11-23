@@ -108,6 +108,23 @@ func TestSetForwardedHeaders(t *testing.T) {
 			},
 		},
 		{
+			// Upstreams read these as the proxy's word, and it says nothing.
+			name:       "address headers the proxy does not set are dropped",
+			host:       "example.com",
+			remoteAddr: "192.0.2.10:54321",
+			inboundHeader: http.Header{
+				"X-Real-Ip":          []string{"10.0.0.1"},
+				"True-Client-Ip":     []string{"10.0.0.1"},
+				"Cf-Connecting-Ip":   []string{"10.0.0.1"},
+				"X-Forwarded-Port":   []string{"8443"},
+				"X-Forwarded-Prefix": []string{"/admin"},
+			},
+			expectedHeaders: map[string]string{
+				"X-Forwarded-For": "192.0.2.10",
+			},
+			unsetHeaders: []string{"X-Real-IP", "True-Client-IP", "CF-Connecting-IP", "X-Forwarded-Port", "X-Forwarded-Prefix"},
+		},
+		{
 			// Whatever the client claimed must be replaced, never appended to.
 			name:       "client supplied values are replaced",
 			host:       "example.com",
@@ -218,19 +235,14 @@ func TestRejectMalformedHost(t *testing.T) {
 	}
 }
 
-// newTestProxy builds the proxy exactly as main does, so the test exercises the
-// real Rewrite hook rather than a copy of it.
-func newTestProxy(target *url.URL) *httputil.ReverseProxy {
+// newTestProxy builds the proxy with main's Rewrite hook.
+func newTestProxy(t *testing.T, target *url.URL) *httputil.ReverseProxy {
+	t.Helper()
+
 	return &httputil.ReverseProxy{
-		Rewrite: func(proxyRequest *httputil.ProxyRequest) {
-			inbound := proxyRequest.In
-			outbound := proxyRequest.Out
-
-			proxyRequest.SetURL(target)
-			outbound.Host = inbound.Host
-
-			setForwardedHeaders(outbound, inbound)
-		},
+		Rewrite: newRewrite(target, func(reason string, err error, _ ...any) {
+			t.Errorf("%s %v", reason, err)
+		}),
 	}
 }
 
@@ -276,12 +288,14 @@ func TestProxyForwardedHeaders(t *testing.T) {
 			t.Parallel()
 
 			var reached bool
+			var seenRealIp string
 			var seenForwardedFor string
 			var seenForwarded string
 			var seenHost string
 
 			upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
 				reached = true
+				seenRealIp = request.Header.Get("X-Real-IP")
 				seenForwardedFor = request.Header.Get("X-Forwarded-For")
 				seenForwarded = request.Header.Get("Forwarded")
 				seenHost = request.Host
@@ -293,7 +307,7 @@ func TestProxyForwardedHeaders(t *testing.T) {
 				t.Fatalf("parse upstream url: %v", err)
 			}
 
-			front := httptest.NewServer(rejectMalformedHost(newTestProxy(target)))
+			front := httptest.NewServer(rejectMalformedHost(newTestProxy(t, target)))
 			defer front.Close()
 
 			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, front.URL, nil)
@@ -304,6 +318,7 @@ func TestProxyForwardedHeaders(t *testing.T) {
 			if testCase.inboundForwarded != "" {
 				request.Header.Set("X-Forwarded-For", testCase.inboundForwarded)
 			}
+			request.Header.Set("X-Real-IP", "203.0.113.9")
 
 			response, err := http.DefaultClient.Do(request)
 			if err != nil {
@@ -318,6 +333,10 @@ func TestProxyForwardedHeaders(t *testing.T) {
 					t.Errorf("%s: status = %d and upstream reached = %v, want a 400 it never saw", testCase.name, response.StatusCode, reached)
 				}
 				return
+			}
+
+			if seenRealIp != "" {
+				t.Errorf("%s: upstream saw the client's X-Real-IP %q", testCase.name, seenRealIp)
 			}
 
 			if seenForwardedFor != "127.0.0.1" {
