@@ -96,13 +96,11 @@ type UpstreamConfiguration struct {
 // duplicates into journal-remote, whose vacuuming then evicted the other hosts'
 // logs from the retention window.
 //
-// This must wrap the *server's* handler, not an individual vhost's:
-// http.ResponseController reaches the connection by unwrapping the
-// ResponseWriter, and VhostMux hands its specifications a wrapper with no
-// Unwrap method, so from inside a vhost every call fails with "feature not
-// supported" and the deadline silently stays put. Out here the writer is still
-// net/http's own. The host is resolved with the same helper VhostMux routes on
-// so the two cannot disagree about which vhost a request belongs to.
+// It wraps the *server's* handler, not a vhost's: it was written when VhostMux
+// handed its specifications a writer with no Unwrap method, through which
+// http.ResponseController could not reach the connection. The host is resolved
+// with the same helper VhostMux routes on so the two cannot disagree about
+// which vhost a request belongs to.
 //
 // Out here the request has not met the mux's server name check either, so the
 // wrapper makes it itself: otherwise a client without a certificate could
@@ -295,17 +293,55 @@ func hostPortIsNumeric(authority string) bool {
 	return strings.Trim(port, "0123456789") == ""
 }
 
+// maxLoggedHostLength bounds the Host a refusal logs, so that a refusal cannot
+// fill a log line.
+const maxLoggedHostLength = 256
+
 // rejectMalformedHost refuses a request whose Host has a port that is not a
-// number, before the Host is routed on or copied into a forwarded header.
-func rejectMalformedHost(handler http.Handler) http.Handler {
+// number, before the Host is routed on or copied into a forwarded header. It
+// logs the refusal itself, since the mux that logs the others never sees it.
+func rejectMalformedHost(handler http.Handler, logWarning func(string, ...any)) http.Handler {
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 		if !hostPortIsNumeric(request.Host) {
+			host := request.Host
+			if len(host) > maxLoggedHostLength {
+				host = host[:maxLoggedHostLength]
+			}
+
+			logWarning(
+				"A request whose host has a malformed port was refused.",
+				slog.Group("source", slog.String("address", request.RemoteAddr)),
+				slog.Group("url", slog.String("domain", host)),
+			)
+
 			responseWriter.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
 		handler.ServeHTTP(responseWriter, request)
 	})
+}
+
+// newRootHandler wraps the vhost mux in what has to see a request before it:
+// the Host check outermost, so nothing acts on a malformed Host, then the
+// lifting of the read deadline for the streaming hosts.
+func newRootHandler(
+	vhostMux *altshiftMux.VhostMux,
+	streamRequestBodyHosts map[string]struct{},
+	logError func(string, error, ...any),
+	logWarning func(string, ...any),
+) http.Handler {
+	var rootHandler http.Handler = vhostMux
+	if len(streamRequestBodyHosts) != 0 {
+		rootHandler = streamRequestBody(
+			rootHandler,
+			streamRequestBodyHosts,
+			vhostMux.TrustForwardedHost,
+			logError,
+		)
+	}
+
+	return rejectMalformedHost(rootHandler, logWarning)
 }
 
 // clientClaimedHeaders are headers upstreams take a client's address or the
@@ -619,6 +655,11 @@ func main() {
 		l.Error(err.Error(), err, input...)
 	}
 
+	logWarning := func(reason string, attrs ...any) {
+		l := makeLogger(slog.String("dataset", "reverse_proxy"), slog.String("reason", reason))
+		l.Warn(reason, attrs...)
+	}
+
 	serverAddress := config.ServerAddress
 	if serverAddress == "" {
 		logFatal(
@@ -853,16 +894,7 @@ func main() {
 		}
 	}
 
-	var rootHandler http.Handler = vhostMux
-	if len(streamRequestBodyHosts) != 0 {
-		rootHandler = streamRequestBody(
-			rootHandler,
-			streamRequestBodyHosts,
-			vhostMux.TrustForwardedHost,
-			logError,
-		)
-	}
-	rootHandler = rejectMalformedHost(rootHandler)
+	rootHandler := newRootHandler(vhostMux, streamRequestBodyHosts, logError, logWarning)
 
 	server := newHttpServer(serverAddress, rootHandler, newServerTlsConfig(hostToTlsConfig))
 

@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
+	altshiftMux "github.com/altshiftab/utils_go/pkg/http/mux"
 )
 
 func TestSetForwardedHeaders(t *testing.T) {
@@ -208,6 +210,7 @@ func TestRejectMalformedHost(t *testing.T) {
 		{name: "a non-numeric port after an ipv6 address", host: "[2001:db8::1]:x"},
 		{name: "text after an ipv6 address", host: "[2001:db8::1]x"},
 		{name: "an unterminated bracket", host: "[2001:db8::1"},
+		{name: "a long malformed host", host: "restic.home.arpa:1;" + strings.Repeat("a", 4096)},
 	}
 
 	for _, testCase := range testCases {
@@ -215,9 +218,15 @@ func TestRejectMalformedHost(t *testing.T) {
 			t.Parallel()
 
 			var served bool
-			handler := rejectMalformedHost(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-				served = true
-			}))
+			var warnings []string
+			handler := rejectMalformedHost(
+				http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					served = true
+				}),
+				func(reason string, attrs ...any) {
+					warnings = append(warnings, fmt.Sprint(append([]any{reason}, attrs...)...))
+				},
+			)
 
 			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
 			request.Host = testCase.host
@@ -231,6 +240,113 @@ func TestRejectMalformedHost(t *testing.T) {
 
 			if !testCase.expectServed && recorder.Code != http.StatusBadRequest {
 				t.Errorf("%s: status = %d, want %d", testCase.name, recorder.Code, http.StatusBadRequest)
+			}
+
+			// The mux logs the requests it refuses; this one never reaches it.
+			if testCase.expectServed == (len(warnings) != 0) {
+				t.Errorf("%s: served = %v with %d warnings logged", testCase.name, served, len(warnings))
+			}
+
+			for _, warning := range warnings {
+				if len(warning) > 2*maxLoggedHostLength {
+					t.Errorf("%s: logged %d bytes for one refusal", testCase.name, len(warning))
+				}
+			}
+		})
+	}
+}
+
+// TestNewRootHandler checks what main puts in front of the vhost mux, and in
+// which order. A recorder cannot set a deadline, so an attempt to lift one
+// shows as an error passed to logError.
+func TestNewRootHandler(t *testing.T) {
+	t.Parallel()
+
+	const (
+		openHost   = "restic.home.arpa"
+		streamHost = "upload-logs.home.arpa"
+	)
+
+	testCases := []struct {
+		name                 string
+		serverName           string
+		host                 string
+		expectStatus         int
+		expectServed         bool
+		expectDeadlineLifted bool
+		expectWarningsLogged bool
+	}{
+		{
+			name:         "a host reaches its vhost",
+			serverName:   openHost,
+			host:         openHost,
+			expectStatus: http.StatusOK,
+			expectServed: true,
+		},
+		{
+			name:                 "the streaming host has its deadline lifted",
+			serverName:           streamHost,
+			host:                 streamHost,
+			expectStatus:         http.StatusOK,
+			expectServed:         true,
+			expectDeadlineLifted: true,
+		},
+		{
+			// Refused before streamRequestBody, which would route it to the
+			// streaming host and lift the deadline for it.
+			name:                 "a malformed host is refused before anything acts on it",
+			serverName:           streamHost,
+			host:                 streamHost + ":1;for=10.0.0.1",
+			expectStatus:         http.StatusBadRequest,
+			expectWarningsLogged: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var served bool
+			vhost := &altshiftMux.VhostMuxSpecification{
+				Mux: http.HandlerFunc(func(responseWriter http.ResponseWriter, _ *http.Request) {
+					served = true
+					responseWriter.WriteHeader(http.StatusOK)
+				}),
+			}
+			vhostMux := &altshiftMux.VhostMux{
+				HostToSpecification: map[string]*altshiftMux.VhostMuxSpecification{openHost: vhost, streamHost: vhost},
+			}
+
+			var deadlineErrors int
+			var warnings int
+			handler := newRootHandler(
+				vhostMux,
+				map[string]struct{}{streamHost: {}},
+				func(string, error, ...any) { deadlineErrors++ },
+				func(string, ...any) { warnings++ },
+			)
+
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/upload", nil)
+			request.Host = testCase.host
+			request.TLS = &tls.ConnectionState{ServerName: testCase.serverName}
+
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+
+			if recorder.Code != testCase.expectStatus {
+				t.Errorf("%s: status = %d, want %d", testCase.name, recorder.Code, testCase.expectStatus)
+			}
+
+			if served != testCase.expectServed {
+				t.Errorf("%s: served = %v, want %v", testCase.name, served, testCase.expectServed)
+			}
+
+			if lifted := deadlineErrors != 0; lifted != testCase.expectDeadlineLifted {
+				t.Errorf("%s: deadline lifted = %v, want %v", testCase.name, lifted, testCase.expectDeadlineLifted)
+			}
+
+			if logged := warnings != 0; logged != testCase.expectWarningsLogged {
+				t.Errorf("%s: warning logged = %v, want %v", testCase.name, logged, testCase.expectWarningsLogged)
 			}
 		})
 	}
@@ -308,7 +424,7 @@ func TestProxyForwardedHeaders(t *testing.T) {
 				t.Fatalf("parse upstream url: %v", err)
 			}
 
-			front := httptest.NewServer(rejectMalformedHost(newTestProxy(t, target)))
+			front := httptest.NewServer(rejectMalformedHost(newTestProxy(t, target), func(string, ...any) {}))
 			defer front.Close()
 
 			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, front.URL, nil)
