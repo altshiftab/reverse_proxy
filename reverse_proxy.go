@@ -104,6 +104,10 @@ type UpstreamConfiguration struct {
 // net/http's own. The host is resolved with the same helper VhostMux routes on
 // so the two cannot disagree about which vhost a request belongs to.
 //
+// Out here the request has not met the mux's server name check either, so the
+// wrapper makes it itself: otherwise a client without a certificate could
+// handshake as an open vhost, name this one, and hold the connection forever.
+//
 // Clearing per request keeps ReadTimeout in force for every other vhost.
 func streamRequestBody(
 	handler http.Handler,
@@ -114,7 +118,7 @@ func streamRequestBody(
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 		host := altshiftForwardedHeaders.Host(request, trustForwardedHost)
 
-		if _, ok := streamHosts[host]; ok {
+		if _, ok := streamHosts[host]; ok && connectionOpenedFor(request, host, trustForwardedHost) {
 			if err := http.NewResponseController(responseWriter).SetReadDeadline(time.Time{}); err != nil {
 				// Not fatal: the request is still served, only with the deadline
 				// the server set for it.
@@ -128,6 +132,17 @@ func streamRequestBody(
 
 		handler.ServeHTTP(responseWriter, request)
 	})
+}
+
+// connectionOpenedFor reports whether request arrived on a TLS connection whose
+// server name is host, as the mux requires before routing to it; trusting the
+// forwarded headers waives the check there, and so here.
+func connectionOpenedFor(request *http.Request, host string, trustForwardedHost bool) bool {
+	if trustForwardedHost {
+		return true
+	}
+
+	return request.TLS != nil && altshiftForwardedHeaders.HostFromAuthority(request.TLS.ServerName) == host
 }
 
 // permittedCommonName reports whether the request carries a verified client

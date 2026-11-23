@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json/v2"
 	"errors"
 	"io"
@@ -422,9 +423,9 @@ func TestUpstreamConfigurationUnmarshal(t *testing.T) {
 
 // TestStreamRequestBody drives a real server whose ReadTimeout is shorter than
 // the body takes to arrive, which is the shape that cut every journal-upload at
-// 60s. The unconfigured case is what every vhost still gets, so together they
-// pin both halves: the deadline is lifted where it is asked for and nowhere
-// else.
+// 60s. The other cases are what every other request still gets, so together
+// they pin both halves: the deadline is lifted where it is asked for and
+// nowhere else.
 func TestStreamRequestBody(t *testing.T) {
 	t.Parallel()
 
@@ -433,23 +434,55 @@ func TestStreamRequestBody(t *testing.T) {
 		chunkCount        = 4
 		chunkDelay        = 200 * time.Millisecond
 		chunk             = "0123456789"
+		streamHost        = "upload-logs.home.arpa"
+		openHost          = "restic.home.arpa"
 	)
+
+	ca := newAuthority(t, "test ca")
+	serverCertificate := ca.issue(t, "server", streamHost, openHost)
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.certificate)
 
 	testCases := []struct {
 		name string
-		// configured makes the request's own host one of streamHosts, as
-		// upload-logs.home.arpa is; otherwise the set names a different host and
-		// the request must keep the deadline the server gave it.
-		configured      bool
-		expectReadError bool
+		// serverName is the one the connection is opened for; empty serves the
+		// request over plain HTTP.
+		serverName         string
+		host               string
+		forwardedHost      string
+		trustForwardedHost bool
+		expectReadError    bool
 	}{
 		{
-			name:       "configured host outlives the read timeout",
-			configured: true,
+			name:       "the streaming host outlives the read timeout",
+			serverName: streamHost,
+			host:       streamHost,
 		},
 		{
-			name:            "unconfigured host keeps the read timeout",
+			name:            "another host keeps the read timeout",
+			serverName:      openHost,
+			host:            openHost,
 			expectReadError: true,
+		},
+		{
+			// The mux refuses this with a 421, but net/http drains the unread
+			// body first, with no deadline left to end it.
+			name:            "naming the streaming host on another host's connection keeps the read timeout",
+			serverName:      openHost,
+			host:            streamHost,
+			expectReadError: true,
+		},
+		{
+			name:            "plain http keeps the read timeout",
+			host:            streamHost,
+			expectReadError: true,
+		},
+		{
+			name:               "a trusted forwarded host is enough, as it is for the mux",
+			serverName:         openHost,
+			host:               openHost,
+			forwardedHost:      streamHost,
+			trustForwardedHost: true,
 		},
 	}
 
@@ -470,24 +503,26 @@ func TestStreamRequestBody(t *testing.T) {
 				},
 			)
 
-			// httptest serves on a loopback address, so that is the host the
-			// request carries and the one the wrapper has to match on.
-			streamHost := "127.0.0.1"
-			if !testCase.configured {
-				streamHost = "some-other-host.invalid"
-			}
-
 			loggedErrors := make(chan error, 8)
 			handler = streamRequestBody(
 				handler,
 				map[string]struct{}{streamHost: {}},
-				false,
+				testCase.trustForwardedHost,
 				func(_ string, err error, _ ...any) { loggedErrors <- err },
 			)
 
 			server := httptest.NewUnstartedServer(handler)
 			server.Config.ReadTimeout = serverReadTimeout
-			server.Start()
+			client := http.DefaultClient
+			if testCase.serverName != "" {
+				server.TLS = &tls.Config{Certificates: []tls.Certificate{serverCertificate}}
+				server.StartTLS()
+				client = &http.Client{Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: testCase.serverName},
+				}}
+			} else {
+				server.Start()
+			}
 			defer server.Close()
 
 			pipeReader, pipeWriter := io.Pipe()
@@ -511,8 +546,12 @@ func TestStreamRequestBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: new request: %v", testCase.name, err)
 			}
+			request.Host = testCase.host
+			if testCase.forwardedHost != "" {
+				request.Header.Set("X-Forwarded-Host", testCase.forwardedHost)
+			}
 
-			if response, err := server.Client().Do(request); err == nil {
+			if response, err := client.Do(request); err == nil {
 				_ = response.Body.Close()
 			}
 
