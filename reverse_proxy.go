@@ -354,13 +354,24 @@ func newRootHandler(
 
 // clientClaimedHeaders are headers upstreams take a client's address or the
 // public URL from that this proxy does not set, so a client's own value would
-// pass as the proxy's.
+// pass as the proxy's. The X-Client-*, X-Server-Port and X-Tls-* headers are
+// what a load balancer in front says of the client, which utils_go believes in
+// a service that trusts client headers; nothing is in front of this proxy, so
+// no upstream of it is to believe them.
 var clientClaimedHeaders = []string{
 	"X-Real-IP",
 	"True-Client-IP",
 	"CF-Connecting-IP",
 	"X-Forwarded-Port",
 	"X-Forwarded-Prefix",
+	"X-Client-Ip-Address",
+	"X-Client-Port",
+	"X-Client-Geo-City-Name",
+	"X-Client-Geo-Country-Iso-Code",
+	"X-Client-Geo-Region-Iso-Code",
+	"X-Server-Port",
+	"X-Tls-Ja3-Fingerprint",
+	"X-Tls-Ja4-Fingerprint",
 }
 
 // setForwardedHeaders populates the Forwarded (RFC 7239) and X-Forwarded-*

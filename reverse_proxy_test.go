@@ -133,6 +133,36 @@ func TestSetForwardedHeaders(t *testing.T) {
 			unsetHeaders: []string{"X-Real-IP", "True-Client-IP", "CF-Connecting-IP", "X-Forwarded-Port", "X-Forwarded-Prefix"},
 		},
 		{
+			// A load balancer's account of the client is believed by an upstream that
+			// trusts client headers; here it can only be the client's own.
+			name:       "a load balancer's client headers the proxy does not set are dropped",
+			host:       "example.com",
+			remoteAddr: "192.0.2.10:54321",
+			inboundHeader: http.Header{
+				"X-Client-Ip-Address":           []string{"10.0.0.1"},
+				"X-Client-Port":                 []string{"1"},
+				"X-Client-Geo-City-Name":        []string{"Nowhere"},
+				"X-Client-Geo-Country-Iso-Code": []string{"XX"},
+				"X-Client-Geo-Region-Iso-Code":  []string{"XX-01"},
+				"X-Server-Port":                 []string{"1"},
+				"X-Tls-Ja3-Fingerprint":         []string{"forged"},
+				"X-Tls-Ja4-Fingerprint":         []string{"forged"},
+			},
+			expectedHeaders: map[string]string{
+				"X-Forwarded-For": "192.0.2.10",
+			},
+			unsetHeaders: []string{
+				"X-Client-Ip-Address",
+				"X-Client-Port",
+				"X-Client-Geo-City-Name",
+				"X-Client-Geo-Country-Iso-Code",
+				"X-Client-Geo-Region-Iso-Code",
+				"X-Server-Port",
+				"X-Tls-Ja3-Fingerprint",
+				"X-Tls-Ja4-Fingerprint",
+			},
+		},
+		{
 			// Whatever the client claimed must be replaced, never appended to.
 			name:       "client supplied values are replaced",
 			host:       "example.com",
